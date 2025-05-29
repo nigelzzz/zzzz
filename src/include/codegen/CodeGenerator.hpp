@@ -19,6 +19,7 @@ class CodeGenerator final : public AstNodeVisitor {
         m_symbol_table_of_scoping_nodes;
     /// NOTE: `FILE` cannot be simply deleted by `delete`, so we need a custom deleter.
     std::unique_ptr<FILE, decltype(&fclose)> m_output_file{nullptr, &fclose};
+    std::unordered_map<const SymbolEntry *, int> m_local_var_offset;
 
   public:
     ~CodeGenerator() = default;

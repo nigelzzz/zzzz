@@ -49,6 +49,34 @@ static void dumpInstructions(FILE *p_out_file, const char *format, ...) {
     va_end(args);
 }
 
+// --------------------------------------------------------------------------
+//  Helper utilities
+// --------------------------------------------------------------------------
+
+namespace {
+constexpr int kLocalVariableStartOffset = -12; // see README examples
+}
+
+// Keep track of the current stack offset for local variables within a function
+static int current_local_offset = kLocalVariableStartOffset;
+static std::vector<int> offset_stack;
+
+static bool in_text_section = true;
+
+static void switchToTextSection(FILE *out) {
+    if (!in_text_section) {
+        dumpInstructions(out, ".section    .text\n    .align 2\n");
+        in_text_section = true;
+    }
+}
+
+static void switchToRodataSection(FILE *out) {
+    if (in_text_section) {
+        dumpInstructions(out, ".section    .rodata\n    .align 2\n");
+        in_text_section = false;
+    }
+}
+
 void CodeGenerator::visit(ProgramNode &p_program) {
     // Generate RISC-V instructions for program header
     // clang-format off
@@ -72,16 +100,70 @@ void CodeGenerator::visit(ProgramNode &p_program) {
     for_each(p_program.getFuncNodes().begin(), p_program.getFuncNodes().end(),
              visit_ast_node);
 
+    // switch back to text section for main function
+    switchToTextSection(m_output_file.get());
+    dumpInstructions(m_output_file.get(), "    .globl main\n    .type main, @function\nmain:\n");
+    dumpInstructions(m_output_file.get(),
+                     "    addi sp, sp, -128\n    sw ra, 124(sp)\n    sw s0, 120(sp)\n    addi s0, sp, 128\n");
+
+    current_local_offset = kLocalVariableStartOffset;
+    offset_stack.clear();
+    offset_stack.push_back(current_local_offset);
+
     const_cast<CompoundStatementNode &>(p_program.getBody()).accept(*this);
+
+    dumpInstructions(m_output_file.get(),
+                     "    lw ra, 124(sp)\n    lw s0, 120(sp)\n    addi sp, sp, 128\n    jr ra\n    .size main, .-main\n");
 
     m_symbol_manager.popScope();
 }
 
-void CodeGenerator::visit(DeclNode &p_decl) {}
+void CodeGenerator::visit(DeclNode &p_decl) {
+    for (auto &var : p_decl.getVariables()) {
+        var->accept(*this);
+    }
+}
 
-void CodeGenerator::visit(VariableNode &p_variable) {}
+void CodeGenerator::visit(VariableNode &p_variable) {
+    const auto *entry = m_symbol_manager.lookup(p_variable.getName());
+    if (!entry) {
+        return;
+    }
 
-void CodeGenerator::visit(ConstantValueNode &p_constant_value) {}
+    if (entry->getLevel() == 0) {
+        if (entry->getKind() == SymbolEntry::KindEnum::kVariableKind) {
+            dumpInstructions(m_output_file.get(), "    .comm %s, 4, 4\n",
+                             entry->getNameCString());
+        } else if (entry->getKind() == SymbolEntry::KindEnum::kConstantKind) {
+            switchToRodataSection(m_output_file.get());
+            dumpInstructions(m_output_file.get(),
+                             "    .globl %s\n    .type %s, @object\n%s:\n",
+                             entry->getNameCString(), entry->getNameCString(),
+                             entry->getNameCString());
+            auto value = entry->getAttribute().constant()->integer();
+            dumpInstructions(m_output_file.get(), "    .word %ld\n",
+                             static_cast<long>(value));
+        }
+    } else {
+        int offset = current_local_offset;
+        current_local_offset -= 4;
+        offset_stack.back() = current_local_offset;
+        m_local_var_offset[entry] = offset;
+        if (entry->getKind() == SymbolEntry::KindEnum::kConstantKind) {
+            auto value = entry->getAttribute().constant()->integer();
+            dumpInstructions(m_output_file.get(),
+                             "    li t0, %ld\n    sw t0, %d(s0)\n",
+                             static_cast<long>(value), offset);
+        }
+    }
+}
+
+void CodeGenerator::visit(ConstantValueNode &p_constant_value) {
+    auto value = p_constant_value.getConstantPtr()->integer();
+    dumpInstructions(m_output_file.get(),
+                     "    li t0, %ld\n    addi sp, sp, -4\n    sw t0, 0(sp)\n",
+                     static_cast<long>(value));
+}
 
 void CodeGenerator::visit(FunctionNode &p_function) {
     // Reconstruct the scope for looking up the symbol entry.
@@ -99,12 +181,21 @@ void CodeGenerator::visit(CompoundStatementNode &p_compound_statement) {
     m_symbol_manager.pushScope(
         std::move(m_symbol_table_of_scoping_nodes.at(&p_compound_statement)));
 
+    offset_stack.push_back(current_local_offset);
+
     p_compound_statement.visitChildNodes(*this);
+
+    current_local_offset = offset_stack.back();
+    offset_stack.pop_back();
 
     m_symbol_manager.popScope();
 }
 
-void CodeGenerator::visit(PrintNode &p_print) {}
+void CodeGenerator::visit(PrintNode &p_print) {
+    const_cast<ExpressionNode &>(p_print.getTarget()).accept(*this);
+    dumpInstructions(m_output_file.get(),
+                     "    lw a0, 0(sp)\n    addi sp, sp, 4\n    jal ra, printInt\n");
+}
 
 void CodeGenerator::visit(BinaryOperatorNode &p_bin_op) {}
 
@@ -112,9 +203,45 @@ void CodeGenerator::visit(UnaryOperatorNode &p_un_op) {}
 
 void CodeGenerator::visit(FunctionInvocationNode &p_func_invocation) {}
 
-void CodeGenerator::visit(VariableReferenceNode &p_variable_ref) {}
+void CodeGenerator::visit(VariableReferenceNode &p_variable_ref) {
+    const auto *entry = m_symbol_manager.lookup(p_variable_ref.getName());
+    if (!entry) {
+        return;
+    }
 
-void CodeGenerator::visit(AssignmentNode &p_assignment) {}
+    if (entry->getLevel() == 0) {
+        // global variable or constant stored in memory/rodata
+        dumpInstructions(m_output_file.get(), "    la t0, %s\n", entry->getNameCString());
+        dumpInstructions(m_output_file.get(), "    lw t1, 0(t0)\n    mv t0, t1\n");
+    } else {
+        auto it = m_local_var_offset.find(entry);
+        int offset = (it != m_local_var_offset.end()) ? it->second : 0;
+        dumpInstructions(m_output_file.get(), "    lw t0, %d(s0)\n", offset);
+    }
+    dumpInstructions(m_output_file.get(), "    addi sp, sp, -4\n    sw t0, 0(sp)\n");
+}
+
+void CodeGenerator::visit(AssignmentNode &p_assignment) {
+    const auto &lvalue = p_assignment.getLvalue();
+    const auto *entry = m_symbol_manager.lookup(lvalue.getName());
+    if (!entry) {
+        return;
+    }
+
+    if (entry->getLevel() == 0) {
+        dumpInstructions(m_output_file.get(), "    la t0, %s\n", entry->getNameCString());
+    } else {
+        auto it = m_local_var_offset.find(entry);
+        int offset = (it != m_local_var_offset.end()) ? it->second : 0;
+        dumpInstructions(m_output_file.get(), "    addi t0, s0, %d\n", offset);
+    }
+    dumpInstructions(m_output_file.get(), "    addi sp, sp, -4\n    sw t0, 0(sp)\n");
+
+    const_cast<ExpressionNode &>(p_assignment.getExpr()).accept(*this);
+
+    dumpInstructions(m_output_file.get(),
+                     "    lw t0, 0(sp)\n    addi sp, sp, 4\n    lw t1, 0(sp)\n    addi sp, sp, 4\n    sw t0, 0(t1)\n");
+}
 
 void CodeGenerator::visit(ReadNode &p_read) {}
 
